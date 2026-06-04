@@ -51,9 +51,11 @@ from email.mime.text import MIMEText
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Iterator, Pattern
-
+import os 
 import requests
+from dotenv import load_dotenv
 
+load_dotenv()  # Load environment variables from .env file
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
@@ -514,9 +516,9 @@ CACHE_PATH = Path.home() / ".job_monitor_cache.json"
 BROWSER    = BrowserContext()
 
 EMAIL = EmailNotifier(
-    sender    = "mayasegala@gmail.com",
-    password  = "sHz51x&aNWUO*!x4$h",  # app password with 2FA enabled, not my main password!
-    recipient = "mayasegala@gmail.com",
+    sender    = os.environ["JOB_MONITOR_EMAIL"],
+    password  = os.environ["JOB_MONITOR_PASSWORD"],
+    recipient = os.environ["JOB_MONITOR_EMAIL"],
 )
 
 DEFAULT_FILTER = JobFilter(
