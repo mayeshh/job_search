@@ -16,21 +16,48 @@ Architecture
       │ APISources   │         │   Browser    │         │  Notifiers   │
       │ (concurrent) │         │   Sources    │         │              │
       └──────────────┘         │ (sequential, │         └──────────────┘
-       Natera                  │  shared Chrome)        Console / Email
-       Lever boards            └──────────────┘
-                                Guardant / Grail / Myriad / Personalis
-                                Gilead / Amgen / anything with allowlist
+       Greenhouse direct        │  shared Chrome)        Console / Email
+       Lever direct             └──────────────┘
+       SmartRecruiters direct    Kite / Gilead / Labcorp / AstraZeneca
+                                 (Workday boards)
 
 API sources hit the ATS directly (fast). Browser sources load the company's
 own career page in headless Chrome, then intercept the XHR response the page
 makes to its ATS — same JSON, but the request originates from an allowlisted
 origin so it isn't rejected. The interception is robust to DOM changes.
 
-Run
-───
-    pip install requests playwright
-    playwright install chromium
+Setup
+─────
+1.  Install dependencies:
+        pip install requests playwright python-dotenv
+        playwright install chromium
+
+2.  Create a .env file next to this script:
+        JOB_MONITOR_EMAIL=you@gmail.com
+        JOB_MONITOR_PASSWORD=xxxx-xxxx-xxxx-xxxx   ← Gmail App Password (NOT your login password)
+
+    To get a Gmail App Password:
+        • Visit https://myaccount.google.com/security
+        • Enable 2-Step Verification (required)
+        • Search for "App passwords" → create one for Mail
+        • Paste the 16-character code as JOB_MONITOR_PASSWORD
+
+Run once
+────────
     python job_monitor.py
+
+Cron (daily at 8 AM)
+────────────────────
+    crontab -e          ← opens your crontab in $EDITOR
+
+    Add this line (update paths to match your environment):
+        0 8 * * * /opt/anaconda3/envs/job_search/bin/python /Users/mayasegal/Documents/personal/job_search/code/job_search/job_monitor.py >> /tmp/job_monitor.log 2>&1
+
+    View the log:
+        cat /tmp/job_monitor.log
+
+    Verify the cron entry saved:
+        crontab -l
 """
 
 from __future__ import annotations
@@ -118,6 +145,7 @@ class JobFilter:
     keywords:          tuple[str, ...] = ()
     remote_only:       bool            = False
     location_contains: str | None      = None
+    location_any:      tuple[str, ...] = ()  # OR logic: passes if ANY term matches location
 
     def matches(self, job: Job) -> bool:
         title_lc    = job.title.lower()
@@ -128,6 +156,8 @@ class JobFilter:
         if self.remote_only and "remote" not in location_lc:
             return False
         if self.location_contains and self.location_contains.lower() not in location_lc:
+            return False
+        if self.location_any and not any(loc.lower() in location_lc for loc in self.location_any):
             return False
         return True
 
@@ -272,6 +302,38 @@ class LeverSource(JobSource):
 
     def parse_jobs(self, raw: list[dict]) -> Iterator[Job]:
         yield from _parse_lever_payload(raw, self.name)
+
+
+class SmartRecruiterSource(JobSource):
+    """SmartRecruiters public postings API (Guardant Health, AbbVie, etc.)."""
+    kind = "smartrecruiters"
+    API  = "https://api.smartrecruiters.com/v1/companies/{company}/postings"
+
+    def __init__(self, name: str, company: str, filter_: JobFilter | None = None) -> None:
+        super().__init__(name, filter_)
+        self.company = company
+
+    @retry(exceptions=(requests.RequestException,))
+    def fetch_raw(self) -> dict:
+        r = HTTP.get(self.API.format(company=self.company), timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def parse_jobs(self, raw: dict) -> Iterator[Job]:
+        for job in raw.get("content", []):
+            loc = job.get("location", {})
+            if loc.get("remote"):
+                location = "Remote"
+            else:
+                parts    = [loc.get("city", ""), loc.get("region", ""), loc.get("country", "")]
+                location = ", ".join(p for p in parts if p) or "N/A"
+            yield Job(
+                source   = self.name,
+                title    = job.get("name", ""),
+                location = location,
+                url      = job.get("ref", ""),
+                job_id   = job.get("id", ""),
+            )
 
 
 # ─── BROWSER SOURCES (use Playwright to bypass allowlists) ───────────────────
@@ -523,13 +585,27 @@ EMAIL = EmailNotifier(
 
 DEFAULT_FILTER = JobFilter(
     keywords = (
-        "bioinformatics", "computational biolog", "genomics", "epigenomics",
-        "sequencing", "oncology", "cancer", "data scientist", "machine learning",
-        "methylation", "pipeline", "scientist", "bioinformatician",
+        "bioinformatics",
+        "bioinformatician",
+        "biophysics",
+        "computational biolog",
+        "genomics",
+        "epigenomics",
+        "sequencing",
+        "oncology",
+        "cancer",
+        "data scientist",
+        "machine learning",
+        "methylation",
+        "pipeline",
+        "scientist",
     ),
 )
 REMOTE_ONLY     = replace(DEFAULT_FILTER, remote_only=True)
 CALIFORNIA_ONLY = replace(DEFAULT_FILTER, location_contains="california")
+# Passes remote jobs (any geography) OR local CA jobs (in-person, hybrid, or remote).
+# ", ca" catches "Santa Monica, CA"-style locations that omit the full state name.
+LOCAL_OR_REMOTE = replace(DEFAULT_FILTER, location_any=("remote", "california", ", ca"))
 
 
 # ─── SOURCES ─────────────────────────────────────────────────────────────────
@@ -539,23 +615,39 @@ CALIFORNIA_ONLY = replace(DEFAULT_FILTER, location_contains="california")
 #   3. Add a one-liner below
 
 API_SOURCES: list[JobSource] = [
-    # Greenhouse boards without origin allowlists
-    GreenhouseSource("Natera", "natera", REMOTE_ONLY),
+    # Greenhouse (direct API)
+    GreenhouseSource("Natera",           "natera",           LOCAL_OR_REMOTE),
+    GreenhouseSource("Tempus",           "tempus",           LOCAL_OR_REMOTE),
+    GreenhouseSource("Parse Biosciences","parsebiosciences",  LOCAL_OR_REMOTE),
+    GreenhouseSource("10x Genomics",     "10xgenomics",      LOCAL_OR_REMOTE),
+    GreenhouseSource("BridgeBio",        "bridgebio",        LOCAL_OR_REMOTE),
+    GreenhouseSource("Triplebar",        "triplebarbio",     LOCAL_OR_REMOTE),
+    # Astera Labs is a semiconductor/AI-infrastructure company — verify this is the right "Astera"
+    GreenhouseSource("Astera Labs",      "asteralabs",       LOCAL_OR_REMOTE),
+
+    # Lever (direct API)
+    LeverSource("Grail",                 "grailbio",         LOCAL_OR_REMOTE),
+
+    # SmartRecruiters (direct API)
+    SmartRecruiterSource("Guardant Health", "GuardantHealth", LOCAL_OR_REMOTE),
+    SmartRecruiterSource("AbbVie",          "abbvie",         LOCAL_OR_REMOTE),
 ]
 
 BROWSER_SOURCES: list[BrowserSource] = [
-    # Greenhouse with allowlists — point at the company's own careers page
-    GreenhouseBrowserSource("Guardant Health", "https://guardanthealth.com/careers/jobs/",     BROWSER, DEFAULT_FILTER),
-    GreenhouseBrowserSource("Grail",           "https://grail.com/careers/",                   BROWSER, DEFAULT_FILTER),
-    GreenhouseBrowserSource("Myriad Genetics", "https://myriad.com/about-us/careers/",         BROWSER, DEFAULT_FILTER),
-    GreenhouseBrowserSource("Personalis",      "https://www.personalis.com/about/careers/",    BROWSER, DEFAULT_FILTER),
-    GreenhouseBrowserSource("Kite Pharma",     "https://www.kitepharma.com/careers",           BROWSER, CALIFORNIA_ONLY),
+    # Workday sites (use the direct *.myworkdayjobs.com URL, not the wrapper careers page)
+    WorkdayBrowserSource("Gilead",        "https://gilead.wd1.myworkdayjobs.com/en-US/gileadcareers",       BROWSER, LOCAL_OR_REMOTE),
+    WorkdayBrowserSource("Kite Pharma",   "https://gilead.wd1.myworkdayjobs.com/kitepharmacareers",         BROWSER, LOCAL_OR_REMOTE),
+    WorkdayBrowserSource("Amgen",         "https://amgen.wd1.myworkdayjobs.com/en-US/Careers",              BROWSER, LOCAL_OR_REMOTE),
+    WorkdayBrowserSource("Thermo Fisher", "https://thermofisher.wd5.myworkdayjobs.com/ThermoFisherCareers", BROWSER, LOCAL_OR_REMOTE),
+    WorkdayBrowserSource("Labcorp",       "https://labcorp.wd1.myworkdayjobs.com/External",                 BROWSER, LOCAL_OR_REMOTE),
+    # AstraZeneca — Santa Monica is a primary US site; LOCAL_OR_REMOTE catches it via ", ca"
+    WorkdayBrowserSource("AstraZeneca",   "https://astrazeneca.wd3.myworkdayjobs.com/Careers",              BROWSER, LOCAL_OR_REMOTE),
 
-    # Workday sites
-    WorkdayBrowserSource("Gilead",   "https://gilead.wd1.myworkdayjobs.com/en-US/gileadcareers", BROWSER, DEFAULT_FILTER),
-    WorkdayBrowserSource("Amgen",    "https://careers.amgen.com/en/search-jobs",                 BROWSER, DEFAULT_FILTER),
-    WorkdayBrowserSource("AbbVie",   "https://careers.abbvie.com/en/search-jobs",                BROWSER, DEFAULT_FILTER),
-    WorkdayBrowserSource("Thermo Fisher", "https://jobs.thermofisher.com/global/en/search-results", BROWSER, DEFAULT_FILTER),
+    # TODO: Myriad Genetics — uses Oracle Cloud HCM, not yet supported; check myriad.com/careers manually
+    # TODO: Personalis — ATS undetectable from page HTML; check personalis.com/about/careers manually
+    # TODO: Karius — no public ATS board found; check kariusdx.com/about-us/careers manually
+    # TODO: Ambry Genetics — uses UltiPro ATS, not yet supported; check ambrygen.com/company/careers manually
+    # TODO: Evozyne — no standard ATS detected; check evozyne.com/careers manually
 ]
 
 
