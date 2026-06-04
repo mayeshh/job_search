@@ -28,7 +28,7 @@ Run
 ───
     pip install requests
     python job_monitor.py                       # one-off
-    EDITOR=nano crontab -e   →   0 8 * * * /usr/bin/python3 /path/to/job_monitor.py >> /tmp/job_monitor.log 2>&1
+    EDITOR=nano crontab -e   →   0 8 * * * /usr/bin/python3 /Users/mayasegal/Documents/personal/job_search/code/job_search/job_monitor.py >> /Users/mayasegal/Documents/personal/job_search/code/job_search/tmp/job_monitor.log 2>&1
 """
 
 from __future__ import annotations
