@@ -2,51 +2,55 @@
 """
 Job Board Monitor
 ─────────────────
-Polls configured ATS (Applicant Tracking System) endpoints, filters new
-listings by keyword/location rules, and notifies via console and email.
+Polls company career pages, filters new listings by keyword/location rules,
+and notifies via console and email.
 
 Architecture
 ────────────
-                         ┌──────────────────┐
-                         │   JobMonitor     │ orchestrator
-                         └────────┬─────────┘
-                  ┌───────────────┼───────────────┐
-                  ▼               ▼               ▼
-            ┌──────────┐    ┌──────────┐   ┌────────────┐
-            │  Source  │    │  Filter  │   │  Notifier  │
-            │  (ABC)   │    └──────────┘   │   (ABC)    │
-            └────┬─────┘                   └─────┬──────┘
-       ┌────────┼────────┬─────────┐         ┌───┴───┐
-       ▼        ▼        ▼         ▼         ▼       ▼
-   Greenhouse Lever  Workday  IndeedRSS  Console  Email
+                              ┌──────────────────┐
+                              │   JobMonitor     │
+                              └────────┬─────────┘
+              ┌────────────────────────┼────────────────────────┐
+              ▼                        ▼                        ▼
+      ┌──────────────┐         ┌──────────────┐         ┌──────────────┐
+      │ APISources   │         │   Browser    │         │  Notifiers   │
+      │ (concurrent) │         │   Sources    │         │              │
+      └──────────────┘         │ (sequential, │         └──────────────┘
+       Natera                  │  shared Chrome)        Console / Email
+       Lever boards            └──────────────┘
+                                Guardant / Grail / Myriad / Personalis
+                                Gilead / Amgen / anything with allowlist
 
-Each source implements `fetch_raw()` and `parse_jobs()`. Adding a new ATS is
-a 30-line subclass. Network I/O is parallelized with a thread pool; HTTP
-sessions are reused; transient failures are retried with backoff.
+API sources hit the ATS directly (fast). Browser sources load the company's
+own career page in headless Chrome, then intercept the XHR response the page
+makes to its ATS — same JSON, but the request originates from an allowlisted
+origin so it isn't rejected. The interception is robust to DOM changes.
 
 Run
 ───
-    pip install requests
-    python job_monitor.py                       # one-off
-    EDITOR=nano crontab -e   →   0 8 * * * /usr/bin/python3 /Users/mayasegal/Documents/personal/job_search/code/job_search/job_monitor.py >> /Users/mayasegal/Documents/personal/job_search/code/job_search/tmp/job_monitor.log 2>&1
+    pip install requests playwright
+    playwright install chromium
+    python job_monitor.py
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import smtplib
 import time
 import xml.etree.ElementTree as ET
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from functools import wraps
 from pathlib import Path
-from typing import Callable, ClassVar, Iterable, Iterator
+from typing import Any, Callable, ClassVar, Iterator, Pattern
 
 import requests
 
@@ -54,7 +58,7 @@ import requests
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-    format="%(asctime)s  %(levelname)-7s  %(name)-22s  %(message)s",
+    format="%(asctime)s  %(levelname)-7s  %(name)-30s  %(message)s",
     datefmt="%H:%M:%S",
     level=logging.INFO,
 )
@@ -66,7 +70,7 @@ log = logging.getLogger("monitor")
 def retry(
     attempts: int = 3,
     backoff: float = 1.5,
-    exceptions: tuple[type[Exception], ...] = (requests.RequestException,),
+    exceptions: tuple[type[Exception], ...] = (Exception,),
 ) -> Callable:
     """Retry a function with exponential backoff on transient exceptions."""
     def decorator(fn: Callable) -> Callable:
@@ -86,7 +90,6 @@ def retry(
     return decorator
 
 
-# Shared HTTP session — connection pooling across all sources
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": "Mozilla/5.0 (compatible; job-monitor/1.0)"})
 
@@ -148,13 +151,61 @@ class JobCache:
         tmp.replace(self.path)
 
 
-# ─── SOURCES ─────────────────────────────────────────────────────────────────
+# ─── BROWSER CONTEXT ─────────────────────────────────────────────────────────
+
+class BrowserContext:
+    """
+    Lazy-initialized shared Playwright browser. Created on first use, closed
+    when the monitor finishes. Each browser source gets its own page (cheap)
+    rather than its own browser instance (expensive).
+    """
+
+    def __init__(self) -> None:
+        self._playwright = None
+        self._browser    = None
+
+    def _ensure_started(self) -> None:
+        if self._browser is not None:
+            return
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as e:
+            raise RuntimeError(
+                "Playwright not installed. Run: pip install playwright && playwright install chromium"
+            ) from e
+
+        log.info("launching headless chromium")
+        self._playwright = sync_playwright().start()
+        self._browser    = self._playwright.chromium.launch(headless=True)
+
+    @contextmanager
+    def page(self, timeout_ms: int = 30_000):
+        """Yield a fresh page with a sane default timeout."""
+        self._ensure_started()
+        ctx  = self._browser.new_context(
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        )
+        page = ctx.new_page()
+        page.set_default_timeout(timeout_ms)
+        try:
+            yield page
+        finally:
+            ctx.close()
+
+    def close(self) -> None:
+        if self._browser:
+            self._browser.close()
+        if self._playwright:
+            self._playwright.stop()
+
+
+# ─── SOURCE BASE ─────────────────────────────────────────────────────────────
 
 class JobSource(ABC):
     """
-    Abstract base for any ATS integration.
-    Subclasses implement fetch_raw() and parse_jobs(); the template method
-    fetch() handles retry, logging, and exception isolation.
+    Abstract base. Subclasses implement fetch_raw() and parse_jobs();
+    the template method fetch() handles logging and exception isolation.
     """
 
     kind: ClassVar[str] = "abstract"
@@ -165,15 +216,12 @@ class JobSource(ABC):
         self.log     = logging.getLogger(f"src.{self.kind}.{name}")
 
     @abstractmethod
-    def fetch_raw(self) -> object:
-        """Return the raw response payload (JSON dict, XML element, etc.)."""
+    def fetch_raw(self) -> Any: ...
 
     @abstractmethod
-    def parse_jobs(self, raw: object) -> Iterator[Job]:
-        """Yield normalized Job objects from the raw payload."""
+    def parse_jobs(self, raw: Any) -> Iterator[Job]: ...
 
     def fetch(self) -> list[Job]:
-        """Template method. Returns filtered jobs; never raises."""
         try:
             raw  = self.fetch_raw()
             jobs = [j for j in self.parse_jobs(raw) if self.filter_.matches(j)]
@@ -184,8 +232,10 @@ class JobSource(ABC):
             return []
 
 
+# ─── API SOURCES (direct HTTP, no browser) ───────────────────────────────────
+
 class GreenhouseSource(JobSource):
-    """Greenhouse public API. Clean JSON, no auth required."""
+    """Greenhouse public API for boards without origin allowlists."""
     kind = "greenhouse"
     API  = "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
 
@@ -193,25 +243,18 @@ class GreenhouseSource(JobSource):
         super().__init__(name, filter_)
         self.slug = slug
 
-    @retry()
+    @retry(exceptions=(requests.RequestException,))
     def fetch_raw(self) -> dict:
         r = HTTP.get(self.API.format(slug=self.slug), timeout=10)
         r.raise_for_status()
         return r.json()
 
     def parse_jobs(self, raw: dict) -> Iterator[Job]:
-        for job in raw.get("jobs", []):
-            yield Job(
-                source   = self.name,
-                title    = job.get("title", ""),
-                location = job.get("location", {}).get("name", "N/A"),
-                url      = job.get("absolute_url", ""),
-                job_id   = str(job["id"]),
-            )
+        yield from _parse_greenhouse_payload(raw, self.name)
 
 
 class LeverSource(JobSource):
-    """Lever public API. Same idea as Greenhouse, different schema."""
+    """Lever public API for boards without origin allowlists."""
     kind = "lever"
     API  = "https://api.lever.co/v0/postings/{company}?mode=json"
 
@@ -219,114 +262,132 @@ class LeverSource(JobSource):
         super().__init__(name, filter_)
         self.company = company
 
-    @retry()
+    @retry(exceptions=(requests.RequestException,))
     def fetch_raw(self) -> list[dict]:
         r = HTTP.get(self.API.format(company=self.company), timeout=10)
         r.raise_for_status()
         return r.json()
 
     def parse_jobs(self, raw: list[dict]) -> Iterator[Job]:
-        for job in raw:
-            yield Job(
-                source   = self.name,
-                title    = job.get("text", ""),
-                location = job.get("categories", {}).get("location", "N/A"),
-                url      = job.get("hostedUrl", ""),
-                job_id   = job.get("id", ""),
-            )
+        yield from _parse_lever_payload(raw, self.name)
 
 
-class WorkdaySource(JobSource):
+# ─── BROWSER SOURCES (use Playwright to bypass allowlists) ───────────────────
+
+class BrowserSource(JobSource):
     """
-    Workday's internal JSON API. Not officially documented but stable.
-    Endpoint pattern:
-        POST https://{tenant}.{cluster}.myworkdayjobs.com/wday/cxs/{tenant}/{board}/jobs
-    Discover tenant/cluster/board from the public job board URL.
-    Example: https://gilead.wd1.myworkdayjobs.com/en-US/gileadcareers
-             tenant="gilead", cluster="wd1", board="gileadcareers"
+    Base for browser-based scraping. Subclasses provide:
+      - api_pattern : regex matching the ATS API URL the page calls
+      - parse_jobs  : how to read the intercepted JSON
+
+    fetch_raw() loads the careers page, captures the first matching XHR/fetch
+    response, and returns its parsed JSON body.
     """
-    kind = "workday"
-    URL  = "https://{tenant}.{cluster}.myworkdayjobs.com/wday/cxs/{tenant}/{board}/jobs"
+
+    api_pattern: ClassVar[Pattern[str]]
 
     def __init__(
         self,
-        name:       str,
-        tenant:     str,
-        board:      str,
-        cluster:    str = "wd1",
-        search:     str = "",
-        page_limit: int = 100,
-        filter_:    JobFilter | None = None,
+        name:        str,
+        url:         str,
+        browser:     BrowserContext,
+        filter_:     JobFilter | None = None,
+        wait_state:  str  = "networkidle",
+        timeout_ms:  int  = 30_000,
     ) -> None:
         super().__init__(name, filter_)
-        self.tenant     = tenant
-        self.board      = board
-        self.cluster    = cluster
-        self.search     = search
-        self.page_limit = page_limit
+        self.url        = url
+        self.browser    = browser
+        self.wait_state = wait_state
+        self.timeout_ms = timeout_ms
 
-    @retry()
-    def fetch_raw(self) -> dict:
-        url     = self.URL.format(tenant=self.tenant, cluster=self.cluster, board=self.board)
-        payload = {"limit": self.page_limit, "offset": 0, "searchText": self.search, "appliedFacets": {}}
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
-        r       = HTTP.post(url, json=payload, headers=headers, timeout=15)
-        r.raise_for_status()
-        return r.json()
+    @retry(attempts=2, exceptions=(TimeoutError, RuntimeError))
+    def fetch_raw(self) -> Any:
+        captured: list[Any] = []
+
+        def on_response(response):
+            try:
+                if self.api_pattern.search(response.url) and response.ok:
+                    captured.append(response.json())
+            except Exception:
+                pass  # not all responses are JSON
+
+        with self.browser.page(self.timeout_ms) as page:
+            page.on("response", on_response)
+            page.goto(self.url, wait_until=self.wait_state)
+            # Give late XHRs a moment to land
+            page.wait_for_timeout(1500)
+
+        if not captured:
+            raise RuntimeError(f"no response matching {self.api_pattern.pattern} captured at {self.url}")
+        return captured[-1]  # last response usually has the full result set
+
+
+class GreenhouseBrowserSource(BrowserSource):
+    """
+    For Greenhouse boards with origin allowlists (Guardant, Grail, Myriad, etc.).
+    Point at the company's actual careers URL — the embedded Greenhouse iframe
+    will call the API from the allowlisted origin and we capture the response.
+    """
+    kind        = "greenhouse_browser"
+    api_pattern = re.compile(r"boards-api\.greenhouse\.io/.*?/jobs")
 
     def parse_jobs(self, raw: dict) -> Iterator[Job]:
-        base = f"https://{self.tenant}.{self.cluster}.myworkdayjobs.com"
+        yield from _parse_greenhouse_payload(raw, self.name)
+
+
+class WorkdayBrowserSource(BrowserSource):
+    """
+    For Workday-hosted career sites (Gilead, Amgen, AbbVie, etc.).
+    Point at the public job board URL; we intercept the wday/cxs API response.
+    """
+    kind        = "workday_browser"
+    api_pattern = re.compile(r"/wday/cxs/.*?/jobs")
+
+    def parse_jobs(self, raw: dict) -> Iterator[Job]:
+        base = re.match(r"https?://[^/]+", self.url).group(0)
         for job in raw.get("jobPostings", []):
             external = job.get("externalPath", "")
             yield Job(
                 source   = self.name,
                 title    = job.get("title", ""),
                 location = job.get("locationsText", "N/A"),
-                url      = f"{base}{external}",
+                url      = f"{base}{external}" if external else self.url,
                 job_id   = external or job.get("title", ""),
             )
 
 
-class IndeedRSSSource(JobSource):
-    """
-    Fallback for companies on opaque ATS (iCIMS, Taleo, SuccessFactors).
-    Subscribes to an Indeed search RSS feed scoped by query + location.
-    Less precise than a direct API but covers what nothing else can.
-    """
-    kind = "indeed_rss"
-    URL  = "https://www.indeed.com/rss"
+class LeverBrowserSource(BrowserSource):
+    """For Lever boards with origin restrictions."""
+    kind        = "lever_browser"
+    api_pattern = re.compile(r"api\.lever\.co/v0/postings/")
 
-    def __init__(
-        self,
-        name:     str,
-        query:    str,
-        location: str = "",
-        filter_:  JobFilter | None = None,
-    ) -> None:
-        super().__init__(name, filter_)
-        self.query    = query
-        self.location = location
+    def parse_jobs(self, raw: list[dict]) -> Iterator[Job]:
+        yield from _parse_lever_payload(raw, self.name)
 
-    @retry()
-    def fetch_raw(self) -> ET.Element:
-        r = HTTP.get(self.URL, params={"q": self.query, "l": self.location}, timeout=10)
-        r.raise_for_status()
-        return ET.fromstring(r.content)
 
-    def parse_jobs(self, raw: ET.Element) -> Iterator[Job]:
-        for item in raw.iter("item"):
-            title_full = (item.findtext("title") or "").strip()
-            url        = (item.findtext("link") or "").strip()
-            guid       = (item.findtext("guid") or url).strip()
-            # Indeed RSS titles are "Job Title - Company - Location"
-            parts = [p.strip() for p in title_full.rsplit(" - ", 2)]
-            if len(parts) == 3:
-                title, _company, location = parts
-            else:
-                title, location = title_full, "N/A"
-            yield Job(
-                source=self.name, title=title, location=location, url=url, job_id=guid,
-            )
+# ─── SHARED PARSERS ──────────────────────────────────────────────────────────
+
+def _parse_greenhouse_payload(raw: dict, source_name: str) -> Iterator[Job]:
+    for job in raw.get("jobs", []):
+        yield Job(
+            source   = source_name,
+            title    = job.get("title", ""),
+            location = job.get("location", {}).get("name", "N/A"),
+            url      = job.get("absolute_url", ""),
+            job_id   = str(job["id"]),
+        )
+
+
+def _parse_lever_payload(raw: list[dict], source_name: str) -> Iterator[Job]:
+    for job in raw:
+        yield Job(
+            source   = source_name,
+            title    = job.get("text", ""),
+            location = job.get("categories", {}).get("location", "N/A"),
+            url      = job.get("hostedUrl", ""),
+            job_id   = job.get("id", ""),
+        )
 
 
 # ─── NOTIFIERS ───────────────────────────────────────────────────────────────
@@ -395,14 +456,28 @@ class EmailNotifier(Notifier):
 
 @dataclass
 class JobMonitor:
-    sources:   list[JobSource]
-    cache:     JobCache
-    notifiers: list[Notifier]
-    workers:   int = 8
+    """
+    Runs all sources, dedupes against cache, dispatches notifications.
+
+    Execution model:
+      • API sources run in parallel (ThreadPoolExecutor, I/O bound)
+      • Browser sources run sequentially in the shared browser
+        (sync Playwright isn't thread-safe; parallel browsers are memory-heavy)
+    """
+    api_sources:     list[JobSource]
+    browser_sources: list[BrowserSource]
+    cache:           JobCache
+    notifiers:       list[Notifier]
+    browser:         BrowserContext
+    workers:         int = 8
 
     def run(self) -> list[Job]:
-        log.info(f"polling {len(self.sources)} sources with {self.workers} workers")
-        all_jobs = self._fetch_concurrent()
+        total = len(self.api_sources) + len(self.browser_sources)
+        log.info(f"polling {total} sources ({len(self.api_sources)} API, {len(self.browser_sources)} browser)")
+
+        all_jobs: list[Job] = []
+        all_jobs.extend(self._run_api_sources())
+        all_jobs.extend(self._run_browser_sources())
 
         new_jobs = [j for j in all_jobs if self.cache.is_new(j)]
         for job in new_jobs:
@@ -412,28 +487,38 @@ class JobMonitor:
         log.info(f"{len(new_jobs)} new of {len(all_jobs)} total matching listings")
         for notifier in self.notifiers:
             notifier.notify(new_jobs)
+
+        self.browser.close()
         return new_jobs
 
-    def _fetch_concurrent(self) -> list[Job]:
-        all_jobs: list[Job] = []
+    def _run_api_sources(self) -> list[Job]:
+        if not self.api_sources:
+            return []
+        jobs: list[Job] = []
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
-            futures = {pool.submit(src.fetch): src for src in self.sources}
+            futures = [pool.submit(src.fetch) for src in self.api_sources]
             for future in as_completed(futures):
-                all_jobs.extend(future.result())
-        return all_jobs
+                jobs.extend(future.result())
+        return jobs
+
+    def _run_browser_sources(self) -> list[Job]:
+        jobs: list[Job] = []
+        for src in self.browser_sources:
+            jobs.extend(src.fetch())
+        return jobs
 
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 CACHE_PATH = Path.home() / ".job_monitor_cache.json"
+BROWSER    = BrowserContext()
 
 EMAIL = EmailNotifier(
-    sender    = "your_email@gmail.com",
-    password  = "xxxx xxxx xxxx xxxx",  # Gmail App Password
-    recipient = "your_email@gmail.com",
+    sender    = "mayasegala@gmail.com",
+    password  = "sHz51x&aNWUO*!x4$h",  # app password with 2FA enabled, not my main password!
+    recipient = "mayasegala@gmail.com",
 )
 
-# Shared filter applied to every source unless overridden per-source
 DEFAULT_FILTER = JobFilter(
     keywords = (
         "bioinformatics", "computational biolog", "genomics", "epigenomics",
@@ -441,40 +526,47 @@ DEFAULT_FILTER = JobFilter(
         "methylation", "pipeline", "scientist", "bioinformatician",
     ),
 )
+REMOTE_ONLY     = replace(DEFAULT_FILTER, remote_only=True)
+CALIFORNIA_ONLY = replace(DEFAULT_FILTER, location_contains="california")
 
-# Per-source overrides built with `replace()` — preserves DEFAULT_FILTER's keywords
-REMOTE_ONLY      = replace(DEFAULT_FILTER, remote_only=True)
-CALIFORNIA_ONLY  = replace(DEFAULT_FILTER, location_contains="california")
 
-# Adding a new company is one line: instantiate the appropriate Source.
-SOURCES: list[JobSource] = [
-    # Greenhouse
-    GreenhouseSource("Natera",          "natera",         REMOTE_ONLY),
-    GreenhouseSource("Guardant Health", "guardanthealth", DEFAULT_FILTER),
-    GreenhouseSource("Grail",           "grail",          DEFAULT_FILTER),
-    GreenhouseSource("Myriad Genetics", "myriadgenetics", DEFAULT_FILTER),
-    GreenhouseSource("Kite Pharma",     "kitepharma",     CALIFORNIA_ONLY),
-    GreenhouseSource("Personalis",      "personalis",     DEFAULT_FILTER),
+# ─── SOURCES ─────────────────────────────────────────────────────────────────
+# To add a company:
+#   1. Find its careers URL (where the public job board lives)
+#   2. Pick a source class based on its ATS (Greenhouse / Workday / Lever / etc.)
+#   3. Add a one-liner below
 
-    # Workday — tenant/board discovered from each company's public job board URL
-    WorkdaySource("Gilead", tenant="gilead", board="gileadcareers", search="bioinformatics", filter_=DEFAULT_FILTER),
-    WorkdaySource("Amgen",  tenant="amgen",  board="Amgen_Careers", search="bioinformatics", filter_=DEFAULT_FILTER),
+API_SOURCES: list[JobSource] = [
+    # Greenhouse boards without origin allowlists
+    GreenhouseSource("Natera", "natera", REMOTE_ONLY),
+]
 
-    # Indeed RSS fallback for opaque ATS
-    IndeedRSSSource("Indeed (Abbott Sylmar)",     query="bioinformatics Abbott", location="Sylmar, CA",     filter_=DEFAULT_FILTER),
-    IndeedRSSSource("Indeed (Thermo West Hills)", query="bioinformatics Thermo", location="West Hills, CA", filter_=DEFAULT_FILTER),
+BROWSER_SOURCES: list[BrowserSource] = [
+    # Greenhouse with allowlists — point at the company's own careers page
+    GreenhouseBrowserSource("Guardant Health", "https://guardanthealth.com/careers/jobs/",     BROWSER, DEFAULT_FILTER),
+    GreenhouseBrowserSource("Grail",           "https://grail.com/careers/",                   BROWSER, DEFAULT_FILTER),
+    GreenhouseBrowserSource("Myriad Genetics", "https://myriad.com/about-us/careers/",         BROWSER, DEFAULT_FILTER),
+    GreenhouseBrowserSource("Personalis",      "https://www.personalis.com/about/careers/",    BROWSER, DEFAULT_FILTER),
+    GreenhouseBrowserSource("Kite Pharma",     "https://www.kitepharma.com/careers",           BROWSER, CALIFORNIA_ONLY),
+
+    # Workday sites
+    WorkdayBrowserSource("Gilead",   "https://gilead.wd1.myworkdayjobs.com/en-US/gileadcareers", BROWSER, DEFAULT_FILTER),
+    WorkdayBrowserSource("Amgen",    "https://careers.amgen.com/en/search-jobs",                 BROWSER, DEFAULT_FILTER),
+    WorkdayBrowserSource("AbbVie",   "https://careers.abbvie.com/en/search-jobs",                BROWSER, DEFAULT_FILTER),
+    WorkdayBrowserSource("Thermo Fisher", "https://jobs.thermofisher.com/global/en/search-results", BROWSER, DEFAULT_FILTER),
 ]
 
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────────────
 
 def main() -> None:
-    monitor = JobMonitor(
-        sources   = SOURCES,
-        cache     = JobCache(CACHE_PATH),
-        notifiers = [ConsoleNotifier(), EMAIL],
-    )
-    monitor.run()
+    JobMonitor(
+        api_sources     = API_SOURCES,
+        browser_sources = BROWSER_SOURCES,
+        cache           = JobCache(CACHE_PATH),
+        notifiers       = [ConsoleNotifier(), EMAIL],
+        browser         = BROWSER,
+    ).run()
 
 
 if __name__ == "__main__":
