@@ -86,10 +86,17 @@ load_dotenv()  # Load environment variables from .env file
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────────
 
+_LOG_DIR = Path(__file__).parent / "tmp"
+_LOG_DIR.mkdir(exist_ok=True)
+
 logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(name)-30s  %(message)s",
     datefmt="%H:%M:%S",
     level=logging.INFO,
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_LOG_DIR / "job_monitor.log"),
+    ],
 )
 log = logging.getLogger("monitor")
 
@@ -139,20 +146,52 @@ class Job:
         return f"{self.source}::{self.job_id}"
 
 
+@dataclass(frozen=True)
+class KeywordGroup:
+    """A named set of title keywords with optional per-group title exclusions.
+
+    A job matches this group if its title contains any keyword AND none of the
+    exclude_if_matched terms are present. Groups with triggered exclusions are
+    skipped; the job still passes if matched by any other group.
+    """
+    name:               str
+    keywords:           tuple[str, ...]
+    exclude_if_matched: tuple[str, ...] = ()
+
+
 @dataclass
 class JobFilter:
     """Composable filter applied uniformly to all sources."""
-    keywords:          tuple[str, ...] = ()
-    remote_only:       bool            = False
-    location_contains: str | None      = None
-    location_any:      tuple[str, ...] = ()  # OR logic: passes if ANY term matches location
+    keyword_groups:         tuple[KeywordGroup, ...] = ()
+    keywords:               tuple[str, ...]          = ()  # flat fallback if no groups
+    exclude_title_keywords: tuple[str, ...]          = ()  # global title exclusions
+    remote_only:            bool                     = False
+    location_contains:      str | None               = None
+    location_any:           tuple[str, ...]          = ()  # OR logic: passes if ANY term matches
 
     def matches(self, job: Job) -> bool:
         title_lc    = job.title.lower()
         location_lc = job.location.lower()
 
-        if self.keywords and not any(kw.lower() in title_lc for kw in self.keywords):
+        # Global title exclusions (director, VP, etc.)
+        if self.exclude_title_keywords and any(kw.lower() in title_lc for kw in self.exclude_title_keywords):
             return False
+
+        # Keyword / group matching
+        if self.keyword_groups:
+            # Must match at least one group whose per-group exclusions are not triggered
+            matched = any(
+                any(kw.lower() in title_lc for kw in grp.keywords)
+                and not (grp.exclude_if_matched and any(kw.lower() in title_lc for kw in grp.exclude_if_matched))
+                for grp in self.keyword_groups
+            )
+            if not matched:
+                return False
+        elif self.keywords:
+            if not any(kw.lower() in title_lc for kw in self.keywords):
+                return False
+
+        # Location checks
         if self.remote_only and "remote" not in location_lc:
             return False
         if self.location_contains and self.location_contains.lower() not in location_lc:
@@ -309,9 +348,16 @@ class SmartRecruiterSource(JobSource):
     kind = "smartrecruiters"
     API  = "https://api.smartrecruiters.com/v1/companies/{company}/postings"
 
-    def __init__(self, name: str, company: str, filter_: JobFilter | None = None) -> None:
+    def __init__(
+        self,
+        name:     str,
+        company:  str,
+        filter_:  JobFilter | None = None,
+        url_name: str | None       = None,  # display name used in jobs.smartrecruiters.com URLs
+    ) -> None:
         super().__init__(name, filter_)
-        self.company = company
+        self.company  = company
+        self.url_name = url_name or company
 
     @retry(exceptions=(requests.RequestException,))
     def fetch_raw(self) -> dict:
@@ -327,13 +373,110 @@ class SmartRecruiterSource(JobSource):
             else:
                 parts    = [loc.get("city", ""), loc.get("region", ""), loc.get("country", "")]
                 location = ", ".join(p for p in parts if p) or "N/A"
+            job_id = job.get("id", "")
             yield Job(
                 source   = self.name,
                 title    = job.get("name", ""),
                 location = location,
-                url      = job.get("ref", ""),
-                job_id   = job.get("id", ""),
+                url      = f"https://jobs.smartrecruiters.com/{self.url_name}/{job_id}",
+                job_id   = job_id,
             )
+
+
+class WorkableSource(JobSource):
+    """Workable public widget API (no auth required)."""
+    kind = "workable"
+    API  = "https://apply.workable.com/api/v1/widget/accounts/{slug}"
+
+    def __init__(self, name: str, slug: str, filter_: JobFilter | None = None) -> None:
+        super().__init__(name, filter_)
+        self.slug = slug
+
+    @retry(exceptions=(requests.RequestException,))
+    def fetch_raw(self) -> dict:
+        r = HTTP.get(self.API.format(slug=self.slug), timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    def parse_jobs(self, raw: dict) -> Iterator[Job]:
+        for job in raw.get("jobs", []):
+            loc = job.get("location", {})
+            if job.get("remote"):
+                location = "Remote"
+            else:
+                parts    = [loc.get("city", ""), loc.get("region", ""), loc.get("country", "")]
+                location = ", ".join(p for p in parts if p) or loc.get("location_str", "N/A")
+            shortcode = job.get("shortcode", job.get("id", ""))
+            yield Job(
+                source   = self.name,
+                title    = job.get("title", ""),
+                location = location,
+                url      = f"https://apply.workable.com/{self.slug}/j/{shortcode}/",
+                job_id   = shortcode,
+            )
+
+
+class PhenomSource(JobSource):
+    """Phenom People career sites (Abbott, etc.).
+
+    Jobs are server-rendered into the page HTML as a JSON blob; we fetch pages
+    with ?from=N until exhausted — no Playwright needed.
+    """
+    kind      = "phenom"
+    _KEY      = '"eagerLoadRefineSearch":'
+    PAGE_SIZE = 10
+
+    def __init__(self, name: str, base_url: str, filter_: JobFilter | None = None) -> None:
+        super().__init__(name, filter_)
+        self.base_url = base_url.rstrip("/")
+
+    @staticmethod
+    def _extract_json(html: str) -> dict:
+        idx = html.find(PhenomSource._KEY)
+        if idx < 0:
+            return {}
+        start = idx + len(PhenomSource._KEY)
+        depth, i = 0, start
+        for i in range(start, len(html)):
+            c = html[i]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return json.loads(html[start : i + 1])
+        return {}
+
+    @retry(exceptions=(requests.RequestException,))
+    def _fetch_page(self, from_: int) -> dict:
+        url = f"{self.base_url}?from={from_}&s=1" if from_ else self.base_url
+        r   = HTTP.get(url, timeout=15)
+        r.raise_for_status()
+        return self._extract_json(r.text)
+
+    def fetch_raw(self) -> list[dict]:
+        all_jobs: list[dict] = []
+        from_     = 0
+        while True:
+            page = self._fetch_page(from_)
+            jobs = page.get("data", {}).get("jobs", [])
+            if not jobs:
+                break
+            all_jobs.extend(jobs)
+            total = page.get("totalHits", 0)
+            from_ += self.PAGE_SIZE
+            if from_ >= total:
+                break
+        return all_jobs
+
+    def parse_jobs(self, raw: list[dict]) -> Iterator[Job]:
+        for job in raw:
+            title  = job.get("title", "")
+            loc    = job.get("location") or job.get("cityStateCountry", "N/A")
+            job_id = job.get("jobId") or job.get("reqId", "")
+            slug   = re.sub(r"[^a-zA-Z0-9]+", "-", title).strip("-")
+            url    = f"https://www.jobs.abbott/us/en/job/{job_id}/{slug}"
+            yield Job(source=self.name, title=title, location=loc, url=url, job_id=job_id)
 
 
 # ─── BROWSER SOURCES (use Playwright to bypass allowlists) ───────────────────
@@ -466,11 +609,10 @@ class ConsoleNotifier(Notifier):
         if not jobs:
             log.info("no new listings")
             return
-        print()
+        log.info(f"{len(jobs)} new listing(s):")
         for job in jobs:
-            print(f"  ★ [{job.source}] {job.title}")
-            print(f"    {job.location}")
-            print(f"    {job.url}\n")
+            log.info(f"  ★ [{job.source}] {job.title} | {job.location}")
+            log.info(f"    {job.url}")
 
 
 @dataclass
@@ -584,28 +726,188 @@ EMAIL = EmailNotifier(
 )
 
 DEFAULT_FILTER = JobFilter(
-    keywords = (
-        "bioinformatics",
-        "bioinformatician",
-        "biophysics",
-        "computational biolog",
-        "genomics",
-        "epigenomics",
-        "sequencing",
-        "oncology",
-        "cancer",
-        "data scientist",
-        "machine learning",
-        "methylation",
-        "pipeline",
-        "scientist",
+    keyword_groups = (
+
+        # ── Bioinformatics & Computational Biology ────────────────────────────
+        KeywordGroup("Bioinformatics", keywords=(
+            "bioinformatics",
+            "bioinformatician",
+            "computational biolog",
+            "translational bioinformatics",
+        )),
+
+        # ── Genomics, Sequencing & Epigenomics ───────────────────────────────
+        KeywordGroup("Genomics", keywords=(
+            "genomics",
+            "epigenomics",
+            "sequencing",
+            "methylation",
+            "single molecule",
+            "translational genomics",
+        )),
+
+        # ── Oncology & Cancer ─────────────────────────────────────────────────
+        KeywordGroup("Oncology", keywords=(
+            "oncology",
+            "cancer",
+        )),
+
+        # ── Data Science & Machine Learning ──────────────────────────────────
+        KeywordGroup("Data Science & ML", keywords=(
+            "data scientist",
+            "machine learning",
+        )),
+
+        # ── Translational Science ─────────────────────────────────────────────
+        KeywordGroup("Translational", keywords=(
+            "translational scientist",
+            "translational medicine",
+            "translational research scientist",
+        )),
+
+        # ── Clinical Genomics ─────────────────────────────────────────────────
+        # Exclude senior-level titles (entry-level target for these roles)
+        KeywordGroup("Clinical Genomics", keywords=(
+            "clinical genomics",
+            "clinical genomics scientist",
+            "clinical research scientist",
+            "variant scientist",
+            "genomic data scientist",
+            "oncology scientific advisor",
+        ), exclude_if_matched=(
+            "senior",
+            "sr.",
+            "sr ",
+        )),
+
+        # ── Applications & Product Science ───────────────────────────────────
+        KeywordGroup("Applications Science", keywords=(
+            "applications scientist",
+            "field applications scientist",
+            "field application scientist",
+            "product scientist",
+            "scientific applications specialist",
+        )),
+
+        # ── Scientific & Medical Affairs ──────────────────────────────────────
+        # Exclude senior-level titles and roles requiring a Genetic Counselor (GC) license
+        KeywordGroup("Medical Affairs", keywords=(
+            "medical science liaison",
+            "msl",
+            "scientific liaison",
+            "clinical scientific advisor",
+            "medical affairs scientist",
+        ), exclude_if_matched=(
+            "genetic counsel",
+            "senior",
+            "sr.",
+            "sr ",
+        )),
+
+        # ── Program & Strategy ────────────────────────────────────────────────
+        KeywordGroup("Program Management", keywords=(
+            "scientific program manager",
+            "translational program manager",
+            "research program manager",
+            "genomics program manager",
+        )),
+
+        # ── Research Scientist (broad catch-all) ──────────────────────────────
+        # Senior exclusion here ensures "Senior Clinical Research Scientist" etc. can't
+        # slip through this group when Clinical Genomics / Medical Affairs already blocked it.
+        # Roles with a specific group (Bioinformatics, Genomics, etc.) still pass through
+        # those groups regardless — e.g. "Senior Bioinformatics Scientist" passes via
+        # Bioinformatics, never reaches this catch-all.
+        KeywordGroup("Research Scientist", keywords=(
+            "scientist",
+            "research",
+            "biophysics",
+            "pipeline",
+        ), exclude_if_matched=(
+            "senior",
+            "sr.",
+            "sr ",
+        )),
+
+    ),
+    exclude_title_keywords = (
+        "director",       # catches Director, Senior Director, Associate Director
+        "vice president",
+        "vp",
+        "chief",          # Chief Scientific Officer, Chief Medical Officer, etc.
+        "executive",      # Executive Director, Account Executive, etc.
+        # Senior clinical roles are entry-level for user; non-clinical senior roles
+        # (bioinformatics, genomics, data science) still pass via their own groups.
+        "senior clinical",
+        "sr. clinical",
+        "sr clinical",
     ),
 )
 REMOTE_ONLY     = replace(DEFAULT_FILTER, remote_only=True)
 CALIFORNIA_ONLY = replace(DEFAULT_FILTER, location_contains="california")
-# Passes remote jobs (any geography) OR local CA jobs (in-person, hybrid, or remote).
-# ", ca" catches "Santa Monica, CA"-style locations that omit the full state name.
-LOCAL_OR_REMOTE = replace(DEFAULT_FILTER, location_any=("remote", "california", ", ca"))
+# LA metro + Ventura County cities, plus "remote". Substring-matched case-insensitively.
+# "hollywood" covers North/West/Hollywood; excludes Bay Area (San Carlos, Foster City, etc.).
+_LA_AREA = (
+    "remote",
+    # LA metro + Ventura County, alphabetical. Substring-matched case-insensitively.
+    # "hollywood" covers North/West/Hollywood; excludes Bay Area (San Carlos, Foster City, etc.).
+    "agoura hills",
+    "alhambra",
+    "altadena",
+    "arcadia",
+    "bell canyon",
+    "beverly hills",
+    "brentwood",
+    "burbank",
+    "calabasas",
+    "camarillo",
+    "canoga park",
+    "casa conejo",
+    "chatsworth",
+    "culver city",
+    "duarte",
+    "echo park",
+    "el monte",
+    "el segundo",
+    "encino",
+    "glendale",
+    "granada hills",
+    "highland park",
+    "hollywood",       # north hollywood, west hollywood, hollywood
+    "los angeles",
+    "malibu",
+    "mar vista",
+    "marina del rey",
+    "monrovia",
+    "moorpark",
+    "northridge",
+    "oak park",
+    "oxnard",
+    "pacoima",
+    "panorama city",
+    "pasadena",
+    "porter ranch",
+    "reseda",
+    "rosemead",
+    "san fernando",
+    "san marino",
+    "santa clarita",
+    "santa monica",
+    "sherman oaks",
+    "simi valley",
+    "studio city",
+    "sunland",
+    "sylmar",
+    "tarzana",
+    "thousand oaks",
+    "valley village",
+    "van nuys",
+    "ventura",
+    "west hills",
+    "westwood",
+    "woodland hills",
+)
+LOCAL_OR_REMOTE = replace(DEFAULT_FILTER, location_any=_LA_AREA)
 
 
 # ─── SOURCES ─────────────────────────────────────────────────────────────────
@@ -617,20 +919,26 @@ LOCAL_OR_REMOTE = replace(DEFAULT_FILTER, location_any=("remote", "california", 
 API_SOURCES: list[JobSource] = [
     # Greenhouse (direct API)
     GreenhouseSource("Natera",           "natera",           LOCAL_OR_REMOTE),
-    GreenhouseSource("Tempus",           "tempus",           LOCAL_OR_REMOTE),
     GreenhouseSource("Parse Biosciences","parsebiosciences",  LOCAL_OR_REMOTE),
     GreenhouseSource("10x Genomics",     "10xgenomics",      LOCAL_OR_REMOTE),
     GreenhouseSource("BridgeBio",        "bridgebio",        LOCAL_OR_REMOTE),
-    GreenhouseSource("Triplebar",        "triplebarbio",     LOCAL_OR_REMOTE),
+    # Triplebar posts jobs via LinkedIn (not scrapeable); check triplebar.com/careers manually
     # Astera Labs is a semiconductor/AI-infrastructure company — verify this is the right "Astera"
     GreenhouseSource("Astera Labs",      "asteralabs",       LOCAL_OR_REMOTE),
 
     # Lever (direct API)
     LeverSource("Grail",                 "grailbio",         LOCAL_OR_REMOTE),
 
-    # SmartRecruiters (direct API)
+    # SmartRecruiters (direct API — url_name must match the company slug on jobs.smartrecruiters.com)
     SmartRecruiterSource("Guardant Health", "GuardantHealth", LOCAL_OR_REMOTE),
-    SmartRecruiterSource("AbbVie",          "abbvie",         LOCAL_OR_REMOTE),
+    SmartRecruiterSource("AbbVie",          "abbvie",         LOCAL_OR_REMOTE, url_name="AbbVie"),
+
+    # Workable (direct API)
+    WorkableSource("Molecular Instruments", "molecular-instruments", LOCAL_OR_REMOTE),
+
+    # Phenom People (jobs embedded as server-rendered JSON in page HTML)
+    PhenomSource("Abbott R&D", "https://www.jobs.abbott/us/en/c/research-development-jobs",    LOCAL_OR_REMOTE),
+    PhenomSource("Abbott IT",  "https://www.jobs.abbott/us/en/c/information-technology-jobs",  LOCAL_OR_REMOTE),
 ]
 
 BROWSER_SOURCES: list[BrowserSource] = [
@@ -640,14 +948,25 @@ BROWSER_SOURCES: list[BrowserSource] = [
     WorkdayBrowserSource("Amgen",         "https://amgen.wd1.myworkdayjobs.com/en-US/Careers",              BROWSER, LOCAL_OR_REMOTE),
     WorkdayBrowserSource("Thermo Fisher", "https://thermofisher.wd5.myworkdayjobs.com/ThermoFisherCareers", BROWSER, LOCAL_OR_REMOTE),
     WorkdayBrowserSource("Labcorp",       "https://labcorp.wd1.myworkdayjobs.com/External",                 BROWSER, LOCAL_OR_REMOTE),
-    # AstraZeneca — Santa Monica is a primary US site; LOCAL_OR_REMOTE catches it via ", ca"
     WorkdayBrowserSource("AstraZeneca",   "https://astrazeneca.wd3.myworkdayjobs.com/Careers",              BROWSER, LOCAL_OR_REMOTE),
+    WorkdayBrowserSource("Illumina",      "https://illumina.wd1.myworkdayjobs.com/illumina-careers",        BROWSER, REMOTE_ONLY),
+    WorkdayBrowserSource("Tempus",        "https://tempus.wd5.myworkdayjobs.com/Tempus_Careers",             BROWSER, LOCAL_OR_REMOTE),
+    WorkdayBrowserSource("Medtronic",     "https://medtronic.wd1.myworkdayjobs.com/MedtronicCareers",        BROWSER, LOCAL_OR_REMOTE),
+    # Ambry was acquired by Tempus; its jobs now live on Tempus's Workday instance
+    WorkdayBrowserSource("Ambry",         "https://tempus.wd5.myworkdayjobs.com/en-US/Ambry_Careers",        BROWSER, LOCAL_OR_REMOTE),
+    WorkdayBrowserSource("Takeda",        "https://takeda.wd3.myworkdayjobs.com/External",                   BROWSER, LOCAL_OR_REMOTE),
+    WorkdayBrowserSource("Exact Sciences", "https://exactsciences.wd1.myworkdayjobs.com/Exact_Sciences",      BROWSER, LOCAL_OR_REMOTE),
 
     # TODO: Myriad Genetics — uses Oracle Cloud HCM, not yet supported; check myriad.com/careers manually
     # TODO: Personalis — ATS undetectable from page HTML; check personalis.com/about/careers manually
     # TODO: Karius — no public ATS board found; check kariusdx.com/about-us/careers manually
-    # TODO: Ambry Genetics — uses UltiPro ATS, not yet supported; check ambrygen.com/company/careers manually
     # TODO: Evozyne — no standard ATS detected; check evozyne.com/careers manually
+    # TODO: Agendia — uses Paylocity (JS SPA, no public API); check recruiting.paylocity.com/recruiting/jobs/All/aa7c6256-7022-4a1a-b66d-234fef6f101f/Agendia-Inc
+    # TODO: CG Oncology — email-only (careers@cgoncology.com), no job board
+    # TODO: PBS Biotech — uses JazzHR (applytojob.com), requires employer API key; check pbsbiotech.applytojob.com manually
+    # TODO: Meissner — no job board, contact-based only; check meissner.com/career-opportunities manually
+    # TODO: T-Cure — no current openings; check t-cure.com/about/careers/current-openings periodically
+    # TODO: Paycom portal — company identity unresolvable from URL hash; check paycomonline.net/v4/ats/web.php/portal/E86D60EDAF14F62BD0B3F719F912C645/career-page manually
 ]
 
 
